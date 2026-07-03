@@ -1,0 +1,82 @@
+# mcp-ssh-go
+
+A minimal, **security-first SSH [MCP](https://modelcontextprotocol.io) server** — a
+single static Go binary (no Node/npm, no Python, no runtime) that gives an AI agent
+a deliberately small, auditable set of SSH capabilities over stdio.
+
+Most SSH MCP servers expose *everything*: interactive PTYs, `sudo`/`su`, port
+forwarding, dozens of tools. That's a large, hard-to-audit authority surface. This
+one takes the opposite stance: **seven discrete, loggable operations and nothing
+else.** No interactive terminal, no privilege escalation, no tunnels, no shell-escape
+vectors. Every tool call is one bounded action with a captured result.
+
+## Tools
+
+| Tool | Purpose |
+|------|---------|
+| `ssh_connect` | Open a session (resolves `~/.ssh/config`, incl. ProxyJump) and store it under an id |
+| `ssh_disconnect` | Close a stored session |
+| `ssh_exec` | Run a command on a stored session; returns stdout, stderr, exit code |
+| `ssh_quick_exec` | Connect, run one command, disconnect (stateless) |
+| `ssh_list_dir` | List a remote directory over SFTP |
+| `ssh_upload` | Upload a local file over SFTP |
+| `ssh_download` | Download a remote file over SFTP |
+
+Deliberately **not** included: PTY / interactive shells, `sudo`/`su`, port
+forwarding, batch/parallel exec. Command execution is non-interactive by design.
+
+## Why single-binary
+
+- **No package-manager runtime.** No `node_modules`, no `pip` tree — nothing to
+  supply-chain-compromise at install time. Just one compiled binary you can hash and
+  pin.
+- **Static and portable.** `CGO_ENABLED=0` builds run anywhere with no dependencies;
+  cross-compiles to Linux, Windows, and macOS from one host.
+- **Small and auditable.** ~550 lines; you can read the whole thing.
+
+## Configuration
+
+Connections resolve through `~/.ssh/config` like OpenSSH — `HostName`, `User`,
+`Port`, `IdentityFile` (surrounding quotes stripped), and single-hop `ProxyJump`
+are honored. When no user is configured, it falls back to the local username. Host
+keys are verified against `~/.ssh/known_hosts` with accept-new semantics (unknown
+hosts are added; a *changed* key is rejected).
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `SSH_MCP_ALLOWED_KEY_DIRS` | Colon/comma-separated extra directories from which private keys and `ssh_config` may be read, in addition to `~/.ssh` and `/etc/ssh`. Useful where `$HOME` is a symlink to an NFS/AD home. |
+| `SSH_MCP_ENABLED_TOOLS` | Comma-separated allow-list to further restrict which of the seven tools are exposed (default: all seven). |
+
+## Build
+
+```sh
+go build -o mcp-ssh-go .
+# cross-compile:
+GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o mcp-ssh-go .
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o mcp-ssh-go.exe .
+```
+
+## Use with an MCP client
+
+Register it as a stdio MCP server. Example (Crush / Claude-style `mcp` config):
+
+```json
+{
+  "mcp": {
+    "ssh": {
+      "type": "stdio",
+      "command": "/usr/local/bin/mcp-ssh-go",
+      "env": { "SSH_MCP_ALLOWED_KEY_DIRS": "/uhome/EXAMPLE" },
+      "timeout": 600
+    }
+  }
+}
+```
+
+The agent still needs the user's own `~/.ssh/config` host entries and keys.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
