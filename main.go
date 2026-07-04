@@ -205,8 +205,19 @@ func resolveHost(cfg *ssh_config.Config, alias, userOverride, portOverride strin
 		user:      firstNonEmpty(userOverride, get("User"), localUsername()),
 		proxyJump: get("ProxyJump"),
 	}
-	if idf := get("IdentityFile"); idf != "" {
-		r.identity = append(r.identity, expandHome(idf))
+	// Collect IdentityFile from ALL matching Host blocks, the way OpenSSH does
+	// (the directive is cumulative). Taking only the first match meant a broad
+	// "Host *" IdentityFile shadowed a host-specific key later in the file, so
+	// the wrong key was offered and target auth failed even though plain ssh
+	// (which offers every candidate) succeeded.
+	if cfg != nil {
+		if idfs, err := cfg.GetAll(alias, "IdentityFile"); err == nil {
+			for _, idf := range idfs {
+				if idf = stripQuotes(idf); idf != "" {
+					r.identity = append(r.identity, expandHome(idf))
+				}
+			}
+		}
 	}
 	// Fall back to common default keys if the config specified none.
 	if len(r.identity) == 0 {
