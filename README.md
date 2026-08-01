@@ -48,6 +48,17 @@ hosts are added; a *changed* key is rejected).
 |----------|--------|
 | `SSH_MCP_ALLOWED_KEY_DIRS` | Colon/comma-separated extra directories from which private keys and `ssh_config` may be read, in addition to `~/.ssh` and `/etc/ssh`. Useful where `$HOME` is a symlink to an NFS/AD home. |
 | `SSH_MCP_ENABLED_TOOLS` | Comma-separated allow-list to further restrict which of the seven tools are exposed (default: all seven). |
+| `SSH_MCP_MAX_OUTPUT_BYTES` | Default per-stream (stdout, stderr) cap on exec output returned to the client (default 131072, clamped to [1024, 524288]). |
+
+### Output caps
+
+`ssh_exec` / `ssh_quick_exec` results are capped per stream (default 128 KB,
+per-call override `max_output_bytes` up to 512 KB). Overflowing output comes back
+as the first ~75% + last ~25% of the cap with an inline marker stating how much
+was dropped and how to narrow the command (`head`/`tail`/`grep`) — so an agent
+that `cat`s a multi-MB log gets a usable, self-correcting result instead of a
+tool result larger than its context window. `ssh_list_dir` similarly returns at
+most 2000 entries (plus the true total).
 
 ## Build
 

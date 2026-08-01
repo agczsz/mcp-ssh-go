@@ -8,12 +8,17 @@
 // ssh_upload, ssh_download.
 //
 // Env knobs:
-//   SSH_MCP_ALLOWED_KEY_DIRS  colon/comma-separated extra dirs from which private
-//                             keys and ssh_config may be read (in addition to
-//                             ~/.ssh and /etc/ssh). Needed where $HOME is a
-//                             symlink to an NFS/AD home.
-//   SSH_MCP_ENABLED_TOOLS     comma-separated allow-list to further restrict the
-//                             seven tools at runtime (default: all seven).
+//
+//	SSH_MCP_ALLOWED_KEY_DIRS  colon/comma-separated extra dirs from which private
+//	                          keys and ssh_config may be read (in addition to
+//	                          ~/.ssh and /etc/ssh). Needed where $HOME is a
+//	                          symlink to an NFS/AD home.
+//	SSH_MCP_ENABLED_TOOLS     comma-separated allow-list to further restrict the
+//	                          seven tools at runtime (default: all seven).
+//	SSH_MCP_MAX_OUTPUT_BYTES  default per-stream cap on exec output returned to
+//	                          the client (default 131072, clamped to
+//	                          [1024, 524288]). Overflow is returned as
+//	                          head+tail with a truncation marker.
 package main
 
 import (
@@ -397,19 +402,23 @@ type statusOut struct {
 }
 
 type execIn struct {
-	ID      string `json:"id" jsonschema:"session id returned by ssh_connect"`
-	Command string `json:"command" jsonschema:"command to run on the remote host"`
+	ID             string `json:"id" jsonschema:"session id returned by ssh_connect"`
+	Command        string `json:"command" jsonschema:"command to run on the remote host"`
+	MaxOutputBytes int    `json:"max_output_bytes,omitempty" jsonschema:"per-stream cap on returned bytes (default 131072, max 524288); overflow returns head+tail with a truncation marker"`
 }
 type quickExecIn struct {
-	Host    string `json:"host" jsonschema:"host alias or hostname"`
-	Command string `json:"command" jsonschema:"command to run"`
-	User    string `json:"user,omitempty"`
-	Port    string `json:"port,omitempty"`
+	Host           string `json:"host" jsonschema:"host alias or hostname"`
+	Command        string `json:"command" jsonschema:"command to run"`
+	User           string `json:"user,omitempty"`
+	Port           string `json:"port,omitempty"`
+	MaxOutputBytes int    `json:"max_output_bytes,omitempty" jsonschema:"per-stream cap on returned bytes (default 131072, max 524288); overflow returns head+tail with a truncation marker"`
 }
 type execOut struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
+	Stdout          string `json:"stdout"`
+	Stderr          string `json:"stderr"`
+	ExitCode        int    `json:"exit_code"`
+	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool   `json:"stderr_truncated,omitempty"`
 }
 
 type listDirIn struct {
@@ -425,11 +434,13 @@ type dirEntry struct {
 type listDirOut struct {
 	Path    string     `json:"path"`
 	Entries []dirEntry `json:"entries"`
+	Total   int        `json:"total"`
+	Note    string     `json:"note,omitempty"`
 }
 
 type uploadIn struct {
-	ID        string `json:"id" jsonschema:"session id returned by ssh_connect"`
-	LocalPath string `json:"local_path" jsonschema:"local file path to upload"`
+	ID         string `json:"id" jsonschema:"session id returned by ssh_connect"`
+	LocalPath  string `json:"local_path" jsonschema:"local file path to upload"`
 	RemotePath string `json:"remote_path" jsonschema:"destination path on the remote host"`
 }
 type downloadIn struct {
@@ -473,17 +484,20 @@ func (s *server) disconnect(_ context.Context, _ *mcp.CallToolRequest, in discon
 	return nil, statusOut{Status: "disconnected"}, nil
 }
 
-func runCommand(client *ssh.Client, command string) (execOut, error) {
+func runCommand(client *ssh.Client, command string, maxOutputBytes int) (execOut, error) {
 	sshSession, err := client.NewSession()
 	if err != nil {
 		return execOut{}, err
 	}
 	defer sshSession.Close()
-	var stdout, stderr strings.Builder
-	sshSession.Stdout = &stdout
-	sshSession.Stderr = &stderr
+	limit := clampOutputCap(maxOutputBytes)
+	stdout, stderr := newCapWriter(limit), newCapWriter(limit)
+	sshSession.Stdout = stdout
+	sshSession.Stderr = stderr
 	runErr := sshSession.Run(command)
-	out := execOut{Stdout: stdout.String(), Stderr: stderr.String()}
+	var out execOut
+	out.Stdout, out.StdoutTruncated = stdout.result()
+	out.Stderr, out.StderrTruncated = stderr.result()
 	if runErr == nil {
 		return out, nil
 	}
@@ -499,7 +513,7 @@ func (s *server) exec(_ context.Context, _ *mcp.CallToolRequest, in execIn) (*mc
 	if !ok {
 		return nil, execOut{}, fmt.Errorf("no session with id %q; call ssh_connect first", in.ID)
 	}
-	out, err := runCommand(sess.client, in.Command)
+	out, err := runCommand(sess.client, in.Command, in.MaxOutputBytes)
 	return nil, out, err
 }
 
@@ -509,7 +523,7 @@ func (s *server) quickExec(_ context.Context, _ *mcp.CallToolRequest, in quickEx
 		return nil, execOut{}, err
 	}
 	defer sess.close()
-	out, err := runCommand(sess.client, in.Command)
+	out, err := runCommand(sess.client, in.Command, in.MaxOutputBytes)
 	return nil, out, err
 }
 
@@ -527,7 +541,11 @@ func (s *server) listDir(_ context.Context, _ *mcp.CallToolRequest, in listDirIn
 	if err != nil {
 		return nil, listDirOut{}, err
 	}
-	out := listDirOut{Path: in.Path}
+	out := listDirOut{Path: in.Path, Total: len(infos)}
+	if len(infos) > maxDirEntries {
+		out.Note = fmt.Sprintf("returned first %d of %d entries; list a subdirectory or filter with ssh_exec (ls pattern, find)", maxDirEntries, len(infos))
+		infos = infos[:maxDirEntries]
+	}
 	for _, fi := range infos {
 		out.Entries = append(out.Entries, dirEntry{
 			Name:  fi.Name(),
@@ -630,10 +648,10 @@ func main() {
 		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_disconnect", Description: "Close a stored SSH session."}, s.disconnect)
 	}
 	if on["ssh_exec"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_exec", Description: "Run a command on a stored SSH session and return stdout, stderr and exit code."}, s.exec)
+		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_exec", Description: "Run a command on a stored SSH session and return stdout, stderr and exit code. Output over the per-stream cap (default 128 KB) is returned as head+tail with a truncation marker; narrow with head/tail/grep, or raise max_output_bytes (max 512 KB)."}, s.exec)
 	}
 	if on["ssh_quick_exec"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_quick_exec", Description: "Connect, run one command, and disconnect (stateless)."}, s.quickExec)
+		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_quick_exec", Description: "Connect, run one command, and disconnect (stateless). Output over the per-stream cap (default 128 KB) is returned as head+tail with a truncation marker; narrow with head/tail/grep, or raise max_output_bytes (max 512 KB)."}, s.quickExec)
 	}
 	if on["ssh_list_dir"] {
 		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_list_dir", Description: "List a remote directory over SFTP."}, s.listDir)
