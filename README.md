@@ -60,6 +60,41 @@ that `cat`s a multi-MB log gets a usable, self-correcting result instead of a
 tool result larger than its context window. `ssh_list_dir` similarly returns at
 most 2000 entries (plus the true total).
 
+#### Sizing the cap for your model
+
+The cap is denominated in **bytes**, but the limit it protects is denominated in
+**tokens** — and the ratio between them depends heavily on what the command
+prints:
+
+| Output | Approx. bytes/token | 128 KB is roughly |
+|--------|--------------------|-------------------|
+| Prose, source code, ordinary logs | ~4 | 32k tokens |
+| Dense numeric / tabular output (e.g. `2.651954E+02` columns) | ~1.7 | 78k tokens |
+
+So the same 128 KB default that is comfortable for logs can be **over half the
+context window of a 128k model, and larger than the entire window of a 32k or
+64k one** — the deployments most likely to point this server at solver output, a
+data dump, or a wide CSV. Two such results in one session will exceed a 128k
+window on their own.
+
+**Size `SSH_MCP_MAX_OUTPUT_BYTES` against your model's context window, not
+against the byte figure.** A rough rule for numeric-heavy workloads: pick a cap
+of about `context_tokens × 1.7 ÷ 4` bytes, so that a capped result costs at most
+a quarter of the window and several fit in one session alongside the
+conversation. Worked example: a 128k-token model reading numeric output gives
+~54 KB; rounding down to **48 KB** (`SSH_MCP_MAX_OUTPUT_BYTES=49152`) adds
+headroom and leaves a 36 KB head + 12 KB tail — roughly four capped reads per
+session.
+
+The head+tail split matters for the same reason: batch and solver output tends
+to put its banner and configuration at the top and its results and summary
+statistics at the bottom, so keeping both ends usually preserves the parts a
+question is actually about. Head-only truncation of such a file returns the
+configuration and discards every result.
+
+Raise the limit for a single call with the `max_output_bytes` parameter (up to
+512 KB) rather than raising the default for every call.
+
 ## Build
 
 ```sh
