@@ -1,0 +1,76 @@
+name: Redaction check
+
+# Scans changed files for internal identifiers that must not appear in this
+# public repository.
+#
+# The pattern list is deliberately NOT stored in this repo -- publishing the
+# denylist would republish the very strings it exists to keep out. It lives in
+# the REDACTION_PATTERNS repository secret, one pattern per line.
+#
+# On a match this job reports only file and line number. It never echoes the
+# matched text, because Actions logs on a public repository are world-readable
+# and printing the match would leak it just as effectively as committing it.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_scan:
+        description: "Scan the entire tree instead of just the changed files"
+        type: boolean
+        default: false
+
+jobs:
+  redaction-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Load patterns
+        env:
+          PATTERNS: ${{ secrets.REDACTION_PATTERNS }}
+        run: |
+          umask 077
+          printf '%s\n' "$PATTERNS" | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/patterns.txt"
+          count=$(wc -l < "$RUNNER_TEMP/patterns.txt")
+          # Fail loudly if the secret is missing. A guardrail that silently
+          # passes when misconfigured is worse than no guardrail at all.
+          if [ "$count" -eq 0 ]; then
+            echo "::error::REDACTION_PATTERNS secret is empty or unset -- cannot scan."
+            exit 1
+          fi
+          echo "Loaded $count patterns."
+
+      - name: Scan
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ inputs.full_scan }}" != "true" ]; then
+            git fetch -q origin "${{ github.base_ref }}"
+            mapfile -t files < <(git diff --name-only --diff-filter=d \
+              "origin/${{ github.base_ref }}...HEAD")
+            echo "Scanning ${#files[@]} changed file(s)."
+          else
+            mapfile -t files < <(git ls-files)
+            echo "Scanning ${#files[@]} tracked file(s) (full scan)."
+          fi
+
+          [ "${#files[@]}" -eq 0 ] && { echo "Nothing to scan."; exit 0; }
+
+          failed=0
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || continue
+            # -o would print the match itself, so only line numbers are taken.
+            while IFS=: read -r lineno _; do
+              [ -n "$lineno" ] || continue
+              echo "::error file=$f,line=$lineno::Matches a redaction pattern. Content withheld -- check this line against your local pattern file (SNAP_MCP_PATTERNS)."
+              failed=1
+            done < <(grep -n -i -F -f "$RUNNER_TEMP/patterns.txt" -- "$f" 2>/dev/null || true)
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Redaction check failed. The flagged lines contain internal identifiers"
+            echo "that must not appear in this public repository."
+            exit 1
+          fi
+          echo "Clean -- no redaction patterns found."

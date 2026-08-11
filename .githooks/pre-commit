@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Blocks commits containing internal identifiers that must not reach this
+# public repository.
+#
+# The pattern list lives OUTSIDE the repo, because a denylist of sensitive
+# strings is itself sensitive. Point SNAP_MCP_PATTERNS at it -- one pattern per
+# line. There is deliberately no default: a hardcoded fallback would publish
+# the file's location to everyone who can read this repo.
+#
+# Install with: scripts/install-hooks.sh
+#
+# Like the CI check, this reports file and line only and never prints the
+# matched text.
+#
+# Portability: macOS ships bash 3.2, which has no `mapfile`. Everything here
+# stays within bash 3.2 features so the hook does not error out -- an erroring
+# hook fails OPEN and silently permits exactly what it exists to block.
+
+set -uo pipefail
+
+PATTERNS="${SNAP_MCP_PATTERNS:-}"
+
+if [ -z "$PATTERNS" ]; then
+  echo "pre-commit: SNAP_MCP_PATTERNS is not set." >&2
+  echo "  Point it at your redaction pattern file, one pattern per line, kept" >&2
+  echo "  outside this repository. The redaction check cannot run without it." >&2
+  exit 1
+fi
+
+if [ ! -s "$PATTERNS" ]; then
+  echo "pre-commit: pattern file not found or empty: $PATTERNS" >&2
+  echo "  The redaction check cannot run. Create it, correct SNAP_MCP_PATTERNS," >&2
+  echo "  or bypass deliberately with: git commit --no-verify" >&2
+  exit 1
+fi
+
+files=$(git diff --cached --name-only --diff-filter=d)
+[ -z "$files" ] && exit 0
+
+failed=0
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$f" ] || continue
+  # grep -o would print the match itself; only line numbers are taken.
+  hits=$(grep -n -i -F -f "$PATTERNS" -- "$f" 2>/dev/null | cut -d: -f1 || true)
+  [ -n "$hits" ] || continue
+  while IFS= read -r lineno; do
+    [ -n "$lineno" ] || continue
+    echo "pre-commit: $f:$lineno matches a redaction pattern (content withheld)" >&2
+    failed=1
+  done <<EOF
+$hits
+EOF
+done <<EOF
+$files
+EOF
+
+if [ "$failed" -ne 0 ]; then
+  echo "" >&2
+  echo "Commit blocked: the lines above contain internal identifiers that must" >&2
+  echo "not appear in this public repository. Redact them, or if this is a false" >&2
+  echo "positive, bypass with: git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0

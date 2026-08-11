@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Rejects commit messages that attribute work to AI tooling, per the SOC audit
+# requirement. Violations otherwise require history rewrites to correct.
+#
+# Scope is deliberately narrow: this checks the COMMIT MESSAGE only, never file
+# content. The repository's documentation legitimately discusses AI tooling as
+# subject matter; that is not what this guards against.
+#
+# Install with: scripts/install-hooks.sh
+
+set -uo pipefail
+
+msg_file="$1"
+# Strip comment lines -- git's own template mentions nothing relevant, but a
+# user's commented-out notes should not trip the hook.
+msg=$(grep -v '^#' "$msg_file" || true)
+
+# Attribution patterns, not mere mentions.
+patterns=(
+  'Co-Authored-By:[[:space:]]*Claude'
+  'Co-Authored-By:[[:space:]]*.*anthropic'
+  'Generated with'
+  'Co-authored-by:[[:space:]]*Copilot'
+  '🤖'
+)
+
+failed=0
+for p in "${patterns[@]}"; do
+  if printf '%s' "$msg" | grep -qiE "$p"; then
+    echo "commit-msg: message matches prohibited attribution pattern: $p" >&2
+    failed=1
+  fi
+done
+
+if [ "$failed" -ne 0 ]; then
+  echo "" >&2
+  echo "Commit blocked: commit messages must not attribute work to AI tooling." >&2
+  echo "Describe what changed and why. Do not use --no-verify to bypass this." >&2
+  exit 1
+fi
+
+exit 0
