@@ -1,0 +1,7 @@
+**
+!go.mod
+!go.sum
+!*.go
+!web/
+!web/index.html
+!docker-entrypoint.sh

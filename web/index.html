@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>SSH MCP · 本机管理</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #142f35;
+      --surface: #edf3f1;
+      --paper: #fffdfa;
+      --signal: #e7a72c;
+      --muted: #61777c;
+      --line: #c8d4d1;
+      --danger: #a34431;
+      font-family: Bahnschrift, "Segoe UI Variable", system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--surface);
+      font-synthesis: none;
+      text-rendering: optimizeLegibility;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible {
+      outline: 3px solid var(--signal);
+      outline-offset: 2px;
+    }
+    [hidden] { display: none !important; }
+    .masthead { background: var(--ink); color: var(--paper); border-bottom: 5px solid var(--signal); }
+    .masthead-inner, main { width: min(1040px, calc(100% - 40px)); margin: 0 auto; }
+    .masthead-inner { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 27px 0 24px; }
+    .brand { display: flex; align-items: center; gap: 15px; }
+    .mark { width: 38px; height: 38px; border: 1px solid var(--signal); display: grid; place-items: center; color: var(--signal); font: 700 16px/1 ui-monospace, monospace; }
+    h1 { margin: 0; font-size: clamp(22px, 4vw, 30px); line-height: 1.1; font-weight: 600; letter-spacing: -.025em; }
+    .subtitle { margin: 6px 0 0; color: #c4d3d1; font-size: 13px; }
+    .local-mark { display: flex; align-items: center; gap: 9px; color: #d7e1df; font-size: 13px; white-space: nowrap; }
+    .led { width: 9px; height: 9px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 0 3px #e7a72c22; }
+    main { padding: 27px 0 64px; }
+    .tabs { display: flex; align-items: center; gap: 5px; border-bottom: 1px solid var(--line); margin-bottom: 25px; }
+    .tab { border: 0; background: transparent; color: var(--muted); padding: 12px 17px 13px; border-bottom: 3px solid transparent; margin-bottom: -1px; font-weight: 600; }
+    .tab[aria-selected="true"] { border-bottom-color: var(--signal); color: var(--ink); }
+    .toolbar { display: flex; justify-content: space-between; align-items: end; gap: 16px; margin: 0 0 17px; }
+    h2 { margin: 0; font-size: 22px; letter-spacing: -.02em; font-weight: 600; }
+    .section-note { margin: 6px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .button { border: 1px solid var(--ink); background: var(--ink); color: white; padding: 9px 14px; min-height: 40px; font-weight: 600; }
+    .button:hover { background: #24464c; }
+    .button.secondary { background: var(--paper); color: var(--ink); }
+    .button.secondary:hover { background: #e6eeeb; }
+    .button.danger { color: var(--danger); background: var(--paper); border-color: #d6b6ae; }
+    .button.danger:hover { background: #f9eeeb; }
+    .server-list { border-top: 1px solid var(--line); }
+    .server-row { display: grid; grid-template-columns: minmax(150px, 1.1fr) minmax(220px, 1.7fr) 105px 88px auto; gap: 14px; align-items: center; padding: 15px 12px; border-bottom: 1px solid var(--line); background: var(--paper); }
+    .server-name { font-weight: 650; overflow-wrap: anywhere; }
+    .server-address { color: var(--muted); font: 13px/1.5 ui-monospace, "Cascadia Code", monospace; overflow-wrap: anywhere; }
+    .badge { display: inline-flex; align-items: center; width: fit-content; border: 1px solid var(--line); padding: 4px 7px; font-size: 12px; }
+    .badge.off { color: var(--muted); background: var(--surface); }
+    .row-actions { display: flex; justify-content: end; gap: 6px; }
+    .row-actions .button { min-height: 34px; padding: 6px 9px; font-size: 13px; }
+    .empty { padding: 28px 16px; color: var(--muted); background: var(--paper); border-bottom: 1px solid var(--line); }
+    .form-panel, .status-panel { border: 1px solid var(--line); border-top: 4px solid var(--signal); background: var(--paper); padding: 21px; margin: 18px 0 24px; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px 18px; margin-top: 17px; }
+    .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .field.full { grid-column: 1 / -1; }
+    .field label, .field-label { font-size: 13px; font-weight: 650; }
+    .field input, .field select, .field textarea { width: 100%; border: 1px solid #aebfbb; border-radius: 0; background: #fff; color: var(--ink); padding: 9px 10px; min-height: 40px; }
+    .field textarea { resize: vertical; min-height: 64px; }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .checkbox-line { display: flex; gap: 9px; align-items: center; min-height: 40px; }
+    .checkbox-line input { width: 17px; height: 17px; accent-color: var(--ink); }
+    .form-actions { display: flex; gap: 9px; margin-top: 18px; }
+    .status-message { min-height: 24px; margin: 12px 0 0; color: var(--muted); font-size: 14px; }
+    .status-message.error { color: var(--danger); }
+    .tool-list { border-top: 1px solid var(--line); margin-top: 18px; }
+    .tool-row { display: grid; grid-template-columns: minmax(190px, .8fr) minmax(0, 2fr) 110px; gap: 16px; align-items: start; padding: 16px 12px; border-bottom: 1px solid var(--line); background: var(--paper); }
+    .tool-name { font: 650 14px/1.5 ui-monospace, "Cascadia Code", monospace; overflow-wrap: anywhere; }
+    .tool-description { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .tool-toggle { display: flex; justify-content: end; align-items: center; gap: 8px; font-size: 13px; }
+    .tool-toggle input { width: 17px; height: 17px; accent-color: var(--ink); }
+    .callout { border-left: 4px solid var(--signal); background: #f8f2e4; padding: 12px 14px; margin: 17px 0 0; font-size: 13px; line-height: 1.5; }
+    .status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
+    .status-item { border: 1px solid var(--line); padding: 17px; background: var(--paper); }
+    .status-item h3 { margin: 0 0 9px; font-size: 15px; }
+    .status-value { font-weight: 650; }
+    .status-detail { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 6px 0 0; overflow-wrap: anywhere; }
+    .footer { margin-top: 30px; padding-top: 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    @media (max-width: 760px) {
+      .server-row { grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; }
+      .server-address { grid-column: 1; }
+      .row-actions { grid-column: 2; grid-row: 1 / span 3; flex-direction: column; }
+      .tool-row { grid-template-columns: minmax(0, 1fr) auto; gap: 7px 13px; }
+      .tool-description { grid-column: 1 / -1; grid-row: 2; }
+      .tool-toggle { grid-column: 2; grid-row: 1; }
+    }
+    @media (max-width: 560px) {
+      .masthead-inner, main { width: min(100% - 28px, 1040px); }
+      .masthead-inner { align-items: flex-start; flex-direction: column; gap: 13px; padding: 20px 0; }
+      .local-mark { margin-left: 53px; }
+      main { padding-top: 18px; }
+      .tabs { gap: 0; }
+      .tab { flex: 1; padding-left: 8px; padding-right: 8px; }
+      .toolbar { align-items: flex-start; flex-direction: column; }
+      .form-panel, .status-panel { padding: 16px; }
+      .form-grid, .status-grid { grid-template-columns: 1fr; }
+      .field.full { grid-column: auto; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">SSH</div>
+        <div>
+          <h1>SSH MCP</h1>
+          <p class="subtitle">本机服务器与工具管理</p>
+        </div>
+      </div>
+      <div class="local-mark"><span class="led" aria-hidden="true"></span><span>仅此设备 · loopback</span></div>
+    </div>
+  </header>
+  <main>
+    <nav class="tabs" role="tablist" aria-label="管理页面">
+      <button class="tab" type="button" id="tab-servers" role="tab" aria-selected="true" aria-controls="panel-servers">Servers</button>
+      <button class="tab" type="button" id="tab-tools" role="tab" aria-selected="false" aria-controls="panel-tools" tabindex="-1">Tools</button>
+      <button class="tab" type="button" id="tab-status" role="tab" aria-selected="false" aria-controls="panel-status" tabindex="-1">Status</button>
+    </nav>
+    <p id="notice" class="status-message" role="status" aria-live="polite"></p>
+
+    <section id="panel-servers" role="tabpanel" aria-labelledby="tab-servers">
+      <div class="toolbar">
+        <div>
+          <h2>SSH 目标</h2>
+          <p class="section-note">保存的认证信息留在本机系统钥匙串中。</p>
+        </div>
+        <button id="add-server" class="button" type="button">添加服务器</button>
+      </div>
+      <div id="server-form-panel" class="form-panel" hidden>
+        <h2 id="form-title">添加服务器</h2>
+        <form id="server-form">
+          <div class="form-grid">
+            <div class="field">
+              <label for="server-id">服务器 ID</label>
+              <input id="server-id" name="id" pattern="[A-Za-z0-9._\-]+" required autocomplete="off">
+              <span class="hint">MCP 工具通过此 ID 选择服务器。</span>
+            </div>
+            <div class="field">
+              <label for="server-name">显示名称</label>
+              <input id="server-name" name="name" required autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="server-host">主机名或 IP</label>
+              <input id="server-host" name="host" required autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="server-port">端口</label>
+              <input id="server-port" name="port" type="number" min="1" max="65535" value="22" required>
+            </div>
+            <div class="field">
+              <label for="server-user">登录用户</label>
+              <input id="server-user" name="user" autocomplete="username">
+            </div>
+            <div class="field">
+              <label for="auth-method">认证方式</label>
+              <select id="auth-method" name="auth_method">
+                <option value="agent">ssh-agent</option>
+                <option value="key">密钥文件</option>
+                <option value="password">密码</option>
+              </select>
+            </div>
+            <div id="key-fields" class="field full" hidden>
+              <label for="identity-file">密钥文件路径</label>
+              <input id="identity-file" name="identity_file" autocomplete="off">
+              <span class="hint">密钥内容不会上传；目录需在 ~/.ssh、/etc/ssh 或 SSH_MCP_ALLOWED_KEY_DIRS 中。</span>
+              <label for="key-passphrase">密钥口令</label>
+              <input id="key-passphrase" name="passphrase" type="password" autocomplete="new-password" placeholder="留空以保留已保存口令">
+              <label id="clear-passphrase-line" class="checkbox-line" hidden><input id="clear-passphrase" type="checkbox">清除已保存口令</label>
+            </div>
+            <div id="password-fields" class="field full" hidden>
+              <label for="server-password">登录密码</label>
+              <input id="server-password" name="password" type="password" autocomplete="new-password" placeholder="留空以保留已保存密码">
+              <label id="clear-password-line" class="checkbox-line" hidden><input id="clear-password" type="checkbox">清除已保存密码</label>
+            </div>
+            <div class="field">
+              <label for="server-jump">跳板（可选）</label>
+              <input id="server-jump" name="jump" autocomplete="off" placeholder="库存 ID 或 ssh_config Host">
+            </div>
+            <div class="field">
+              <label for="socks5-host">SOCKS5 主机（可选）</label>
+              <input id="socks5-host" name="socks5_host" autocomplete="off" placeholder="127.0.0.1 或 proxy.example">
+            </div>
+            <div class="field">
+              <label for="socks5-port">SOCKS5 端口</label>
+              <input id="socks5-port" name="socks5_port" type="number" min="1" max="65535" value="1080">
+            </div>
+            <div class="field">
+              <label for="socks5-username">SOCKS5 用户名（可选）</label>
+              <input id="socks5-username" name="socks5_username" autocomplete="username">
+            </div>
+            <div id="socks5-auth-fields" class="field full" hidden>
+              <label for="socks5-password">SOCKS5 密码</label>
+              <input id="socks5-password" name="socks5_password" type="password" autocomplete="new-password" placeholder="留空以保留已保存密码">
+              <label id="clear-socks5-password-line" class="checkbox-line" hidden><input id="clear-socks5-password" type="checkbox">清除已保存密码</label>
+            </div>
+            <div class="field full"><span class="hint">SOCKS5 不能与此服务器的跳板同时设置；跳板服务器可单独配置 SOCKS5。</span></div>
+            <div class="field">
+              <label for="server-timeout">连接超时（秒）</label>
+              <input id="server-timeout" name="connect_timeout_sec" type="number" min="0" max="300" value="0">
+              <span class="hint">0 表示使用默认值。</span>
+            </div>
+            <div class="field">
+              <label for="server-notes">备注（可选）</label>
+              <input id="server-notes" name="notes" autocomplete="off">
+            </div>
+            <div class="field">
+              <span class="field-label">使用状态</span>
+              <label class="checkbox-line"><input id="server-enabled" name="enabled" type="checkbox" checked>允许 MCP 连接此服务器</label>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="button" type="submit">保存服务器</button>
+            <button id="cancel-server" class="button secondary" type="button">取消</button>
+          </div>
+        </form>
+      </div>
+      <div id="server-list" class="server-list" aria-live="polite"></div>
+    </section>
+
+    <section id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
+      <div class="toolbar">
+        <div>
+          <h2>MCP 工具</h2>
+          <p class="section-note">未启用的工具不会出现在当前 MCP tools/list。</p>
+        </div>
+        <button id="save-tools" class="button" type="button">保存工具设置</button>
+      </div>
+      <div id="tool-list" class="tool-list"></div>
+      <p id="tool-callout" class="callout">Ask / Allow 由 Claude Desktop 的 Tool permissions 控制；此处只决定 MCP 暴露哪些工具。保存后立即更新 MCP 工具列表。</p>
+    </section>
+
+    <section id="panel-status" role="tabpanel" aria-labelledby="tab-status" hidden>
+      <div class="toolbar">
+        <div>
+          <h2>运行状态</h2>
+          <p class="section-note">此页面与本机 HTTP MCP 服务运行在同一进程中。</p>
+        </div>
+        <button id="refresh-status" class="button secondary" type="button">刷新状态</button>
+      </div>
+      <div class="status-grid">
+        <article class="status-item">
+          <h3>本机管理地址</h3>
+          <div id="gui-address" class="status-value"></div>
+          <p class="status-detail">只监听 127.0.0.1，不接受局域网连接。</p>
+        </article>
+        <article class="status-item">
+          <h3>MCP Streamable HTTP</h3>
+          <div id="mcp-address" class="status-value"></div>
+          <p class="status-detail">Bearer token 由 SSH_MCP_AUTH_TOKEN 提供；只监听 127.0.0.1。</p>
+        </article>
+        <article class="status-item">
+          <h3>SSH agent</h3>
+          <div id="agent-state" class="status-value">正在检查…</div>
+          <p id="agent-detail" class="status-detail"></p>
+        </article>
+      </div>
+    </section>
+    <footer class="footer">主机密钥使用 ~/.ssh/known_hosts；未知主机接受并记录，已知密钥变化会被拒绝。</footer>
+  </main>
+  <script>
+    const byId = id => document.getElementById(id);
+    const notice = byId('notice');
+    const form = byId('server-form');
+    const formPanel = byId('server-form-panel');
+    let currentServer = null;
+    let settings = null;
+
+    function showNotice(message, isError = false) {
+      notice.textContent = message;
+      notice.classList.toggle('error', isError);
+    }
+
+    async function request(path, options = {}) {
+      const response = await fetch(path, { cache: 'no-store', ...options });
+      if (response.status === 204) return null;
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+      return data;
+    }
+
+    function addText(parent, tag, text, className) {
+      const node = document.createElement(tag);
+      node.textContent = text;
+      if (className) node.className = className;
+      parent.append(node);
+      return node;
+    }
+
+    function makeButton(label, className, action) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = className;
+      button.textContent = label;
+      button.addEventListener('click', action);
+      return button;
+    }
+
+    function renderServers(servers) {
+      const list = byId('server-list');
+      list.replaceChildren();
+      if (!servers.length) {
+        addText(list, 'div', '还没有服务器。添加一个命名服务器，或继续使用已启用的 ssh_config host。', 'empty');
+        return;
+      }
+      for (const server of servers) {
+        const row = document.createElement('div');
+        row.className = 'server-row';
+        row.setAttribute('role', 'group');
+        row.setAttribute('aria-label', `${server.name} (${server.id})`);
+        const name = document.createElement('div');
+        addText(name, 'div', server.name, 'server-name');
+        addText(name, 'div', server.id, 'hint');
+        row.append(name);
+        const endpoint = document.createElement('div');
+        addText(endpoint, 'div', server.address, 'server-address');
+        if (server.socks5_host) addText(endpoint, 'div', `SOCKS5 ${server.socks5_host}:${server.socks5_port}`, 'hint');
+        row.append(endpoint);
+        addText(row, 'div', server.auth_method, 'badge');
+        addText(row, 'div', server.enabled ? '已启用' : '已停用', `badge${server.enabled ? '' : ' off'}`);
+        const actions = document.createElement('div');
+        actions.className = 'row-actions';
+        actions.append(
+          makeButton('测试', 'button secondary', () => testServer(server.id)),
+          makeButton('编辑', 'button secondary', () => editServer(server)),
+          makeButton('删除', 'button danger', () => deleteServer(server.id, server.name))
+        );
+        row.append(actions);
+        list.append(row);
+      }
+    }
+
+    async function loadServers() {
+      try {
+        renderServers(await request('/api/servers'));
+      } catch (error) {
+        showNotice(error.message, true);
+      }
+    }
+
+    function clearForm() {
+      form.reset();
+      currentServer = null;
+      byId('server-id').disabled = false;
+      byId('server-port').value = '22';
+      byId('server-timeout').value = '0';
+      byId('socks5-host').value = '';
+      byId('socks5-port').value = '1080';
+      byId('socks5-username').value = '';
+      byId('socks5-password').value = '';
+      byId('socks5-password').required = false;
+      byId('socks5-auth-fields').hidden = true;
+      byId('clear-socks5-password-line').hidden = true;
+      byId('clear-socks5-password').checked = false;
+      byId('server-enabled').checked = true;
+      byId('clear-password-line').hidden = true;
+      byId('clear-passphrase-line').hidden = true;
+      byId('clear-password').checked = false;
+      byId('clear-passphrase').checked = false;
+      byId('form-title').textContent = '添加服务器';
+      syncAuthFields();
+      syncSocks5Fields();
+    }
+
+    function syncAuthFields() {
+      const auth = byId('auth-method').value;
+      byId('key-fields').hidden = auth !== 'key';
+      byId('password-fields').hidden = auth !== 'password';
+      byId('identity-file').required = auth === 'key';
+      const editing = currentServer !== null;
+      byId('clear-password-line').hidden = auth !== 'password' || !editing || !currentServer.has_password;
+      byId('clear-passphrase-line').hidden = auth !== 'key' || !editing || !currentServer.has_passphrase;
+    }
+
+    function syncSocks5Fields() {
+      const username = byId('socks5-username').value.trim();
+      const hasSavedPassword = currentServer !== null && currentServer.has_socks5_password;
+      byId('socks5-auth-fields').hidden = !username;
+      byId('socks5-password').required = Boolean(username && (!hasSavedPassword || byId('clear-socks5-password').checked));
+      byId('clear-socks5-password-line').hidden = !username || !hasSavedPassword;
+      byId('socks5-port').required = Boolean(byId('socks5-host').value.trim());
+    }
+
+    function editServer(server) {
+      clearForm();
+      currentServer = server;
+      byId('form-title').textContent = `编辑 ${server.name}`;
+      byId('server-id').value = server.id;
+      byId('server-id').disabled = true;
+      byId('server-name').value = server.name;
+      byId('server-host').value = server.host;
+      byId('server-port').value = String(server.port || 22);
+      byId('server-user').value = server.user || '';
+      byId('auth-method').value = server.auth_method;
+      byId('identity-file').value = server.identity_file || '';
+      byId('server-jump').value = server.jump || '';
+      byId('socks5-host').value = server.socks5_host || '';
+      byId('socks5-port').value = String(server.socks5_port || 1080);
+      byId('socks5-username').value = server.socks5_username || '';
+      byId('socks5-password').value = '';
+      byId('clear-socks5-password').checked = false;
+      byId('server-timeout').value = String(server.connect_timeout_sec || 0);
+      byId('server-notes').value = server.notes || '';
+      byId('server-enabled').checked = server.enabled;
+      syncAuthFields();
+      syncSocks5Fields();
+      formPanel.hidden = false;
+      byId('server-name').focus();
+    }
+
+    function formData() {
+      const data = new FormData(form);
+      const authMethod = data.get('auth_method');
+      const socks5Host = data.get('socks5_host').trim();
+      const item = {
+        id: byId('server-id').value.trim(),
+        name: data.get('name').trim(),
+        host: data.get('host').trim(),
+        port: Number(data.get('port')),
+        user: data.get('user').trim(),
+        auth_method: authMethod,
+        identity_file: authMethod === 'key' ? data.get('identity_file').trim() : '',
+        jump: data.get('jump').trim(),
+        socks5_host: socks5Host,
+        socks5_port: socks5Host ? Number(data.get('socks5_port') || 1080) : 0,
+        socks5_username: data.get('socks5_username').trim(),
+        enabled: byId('server-enabled').checked,
+        notes: data.get('notes').trim(),
+        connect_timeout_sec: Number(data.get('connect_timeout_sec') || 0),
+      };
+      const password = data.get('password');
+      const passphrase = data.get('passphrase');
+      const socks5Password = data.get('socks5_password');
+      if (authMethod === 'password' && password) item.password = password;
+      if (authMethod === 'key' && passphrase) item.passphrase = passphrase;
+      if (item.socks5_username && socks5Password) item.socks5_password = socks5Password;
+      if (authMethod === 'password' && byId('clear-password').checked) item.clear_password = true;
+      if (authMethod === 'key' && byId('clear-passphrase').checked) item.clear_passphrase = true;
+      if (byId('clear-socks5-password').checked) item.clear_socks5_password = true;
+      return item;
+    }
+
+    async function saveServer(event) {
+      event.preventDefault();
+      const item = formData();
+      try {
+        await request(`/api/servers/${encodeURIComponent(item.id)}`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item),
+        });
+        formPanel.hidden = true;
+        clearForm();
+        showNotice('服务器已保存。');
+        await loadServers();
+      } catch (error) {
+        showNotice(error.message, true);
+      }
+    }
+
+    async function testServer(id) {
+      showNotice('正在测试 SSH 连接…');
+      try {
+        const result = await request(`/api/servers/${encodeURIComponent(id)}/test`, { method: 'POST' });
+        if (!result.ok) throw new Error(result.error || 'SSH 连接失败');
+        showNotice(`连接成功 · ${result.server_version}`);
+      } catch (error) {
+        showNotice(error.message, true);
+      }
+    }
+
+    async function deleteServer(id, name) {
+      if (!window.confirm(`删除服务器“${name}”及其本机保存的认证信息？`)) return;
+      try {
+        await request(`/api/servers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        showNotice('服务器和对应的本机认证信息已删除。');
+        await loadServers();
+      } catch (error) {
+        showNotice(error.message, true);
+      }
+    }
+
+    async function loadTools() {
+      try {
+        const [tools, saved] = await Promise.all([request('/api/tools'), request('/api/settings')]);
+        settings = saved;
+        const list = byId('tool-list');
+        list.replaceChildren();
+        for (const tool of tools) {
+          const row = document.createElement('div');
+          row.className = 'tool-row';
+          addText(row, 'div', tool.name, 'tool-name');
+          addText(row, 'p', tool.description, 'tool-description');
+          const label = document.createElement('label');
+          label.className = 'tool-toggle';
+          const input = document.createElement('input');
+          input.type = 'checkbox';
+          input.dataset.tool = tool.name;
+          input.checked = saved.environment_override ? saved.effective_enabled_tools.includes(tool.name) : saved.enabled_tools.includes(tool.name);
+          input.disabled = saved.environment_override;
+          label.append(input, document.createTextNode('启用'));
+          row.append(label);
+          list.append(row);
+        }
+        byId('tool-callout').textContent = saved.environment_override
+          ? 'SSH_MCP_ENABLED_TOOLS 环境变量优先于文件设置，当前工具开关已锁定。Ask / Allow 仍由 Claude Desktop 的 Tool permissions 控制。'
+          : 'Ask / Allow 由 Claude Desktop 的 Tool permissions 控制；此处只决定 MCP 暴露哪些工具。保存后立即更新 MCP 工具列表。';
+        byId('save-tools').disabled = saved.environment_override;
+      } catch (error) {
+        showNotice(error.message, true);
+      }
+    }
+
+    async function saveTools() {
+      if (!settings) return;
+      const enabled = [...document.querySelectorAll('[data-tool]')].filter(input => input.checked).map(input => input.dataset.tool);
+      try {
+        await request('/api/settings', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled_tools: enabled,
+            allow_adhoc_host: settings.allow_adhoc_host,
+          }),
+        });
+        showNotice('工具设置已保存并立即生效。');
+        await loadTools();
+      } catch (error) {
+        showNotice(error.message, true);
+      }
+    }
+
+    async function loadStatus() {
+      byId('gui-address').textContent = location.origin;
+      byId('mcp-address').textContent = 'http://127.0.0.1:2223/mcp';
+      byId('agent-state').textContent = '正在检查…';
+      try {
+        const agent = await request('/api/agent');
+        byId('agent-state').textContent = agent.available ? `可连接 · ${agent.signer_count} 个 signer` : '不可用';
+        byId('agent-detail').textContent = agent.message || (agent.signer_count ? '本机 ssh-agent 可用于 agent 认证。' : '已连接 agent，但没有可用密钥。');
+      } catch (error) {
+        byId('agent-state').textContent = '状态读取失败';
+        byId('agent-detail').textContent = error.message;
+      }
+    }
+
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        tabs.forEach(item => {
+          const active = item === tab;
+          item.setAttribute('aria-selected', String(active));
+          item.tabIndex = active ? 0 : -1;
+          byId(item.getAttribute('aria-controls')).hidden = !active;
+        });
+        if (tab.id === 'tab-tools') loadTools();
+        if (tab.id === 'tab-status') loadStatus();
+      });
+      tab.addEventListener('keydown', event => {
+        const current = tabs.indexOf(tab);
+        let next = current;
+        if (event.key === 'ArrowRight') next = (current + 1) % tabs.length;
+        else if (event.key === 'ArrowLeft') next = (current + tabs.length - 1) % tabs.length;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = tabs.length - 1;
+        else return;
+        event.preventDefault();
+        tabs[next].focus();
+        tabs[next].click();
+      });
+    });
+    byId('add-server').addEventListener('click', () => {
+      clearForm();
+      formPanel.hidden = false;
+      byId('server-id').focus();
+    });
+    byId('cancel-server').addEventListener('click', () => {
+      formPanel.hidden = true;
+      clearForm();
+      showNotice('');
+    });
+    byId('auth-method').addEventListener('change', syncAuthFields);
+    byId('socks5-host').addEventListener('input', syncSocks5Fields);
+    byId('socks5-username').addEventListener('input', syncSocks5Fields);
+    byId('clear-socks5-password').addEventListener('change', syncSocks5Fields);
+    byId('server-form').addEventListener('submit', saveServer);
+    byId('save-tools').addEventListener('click', saveTools);
+    byId('refresh-status').addEventListener('click', loadStatus);
+    loadServers();
+  </script>
+</body>
+</html>

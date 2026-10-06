@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build Linux/amd64
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_SHA}" -o dist/mcp-ssh-go-linux-amd64 .
+
+      - name: Build Windows/amd64
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_SHA}" -o dist/mcp-ssh-go-windows-amd64.exe .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-ssh-go-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          tags: mcp-ssh-go:ci

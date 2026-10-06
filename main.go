@@ -1,46 +1,45 @@
 // Command mcp-ssh-go is a minimal, security-first SSH MCP server: a single
-// static Go binary (no Node/npm, no runtime) that exposes exactly seven
-// least-privilege tools over stdio. It deliberately omits interactive PTY,
+// static Go binary (no Node/npm, no runtime) that exposes eight least-privilege
+// tools over authenticated Streamable HTTP. It deliberately omits interactive PTY,
 // sudo/su, port-forwarding and shell-escape surfaces — every call is a
 // discrete, loggable operation.
 //
-// Tools: ssh_connect, ssh_disconnect, ssh_exec, ssh_quick_exec, ssh_list_dir,
-// ssh_upload, ssh_download.
+// Tools: ssh_list_servers, ssh_connect, ssh_disconnect, ssh_exec, ssh_quick_exec,
+// ssh_list_dir, ssh_upload, ssh_download.
 //
-// Env knobs:
-//
-//	SSH_MCP_ALLOWED_KEY_DIRS  colon/comma-separated extra dirs from which private
-//	                          keys and ssh_config may be read (in addition to
-//	                          ~/.ssh and /etc/ssh). Needed where $HOME is a
-//	                          symlink to an NFS/AD home.
-//	SSH_MCP_ENABLED_TOOLS     comma-separated allow-list to further restrict the
-//	                          seven tools at runtime (default: all seven).
-//	SSH_MCP_MAX_OUTPUT_BYTES  default per-stream cap on exec output returned to
-//	                          the client (default 131072, clamped to
-//	                          [1024, 524288]). Overflow is returned as
-//	                          head+tail with a truncation marker.
+// The MCP endpoint listens on 127.0.0.1:2223 and the local GUI on
+// 127.0.0.1:2224. JSON data is stored beside this executable.
 package main
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"os/signal"
 
 	"github.com/kevinburke/ssh_config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"golang.org/x/net/proxy"
 )
 
-const dialTimeout = 20 * time.Second
+const (
+	dialTimeout = 20 * time.Second
+	mcpAddr     = "127.0.0.1:2223"
+)
 
 // ---------------------------------------------------------------------------
 // Session store
@@ -187,15 +186,6 @@ func localUsername() string {
 	return os.Getenv("USER")
 }
 
-// resolved holds the connection parameters for a host after config + overrides.
-type resolved struct {
-	hostName  string
-	port      string
-	user      string
-	identity  []string // candidate private-key paths, in order
-	proxyJump string   // host alias to jump through (single hop), or ""
-}
-
 func resolveHost(cfg *ssh_config.Config, alias, userOverride, portOverride string) resolved {
 	get := func(key string) string {
 		if cfg == nil {
@@ -205,10 +195,11 @@ func resolveHost(cfg *ssh_config.Config, alias, userOverride, portOverride strin
 		return stripQuotes(v)
 	}
 	r := resolved{
-		hostName:  firstNonEmpty(get("HostName"), alias),
-		port:      firstNonEmpty(portOverride, get("Port"), "22"),
-		user:      firstNonEmpty(userOverride, get("User"), localUsername()),
-		proxyJump: get("ProxyJump"),
+		hostName:   firstNonEmpty(get("HostName"), alias),
+		port:       firstNonEmpty(portOverride, get("Port"), "22"),
+		user:       firstNonEmpty(userOverride, get("User"), localUsername()),
+		proxyJump:  get("ProxyJump"),
+		authMethod: "key",
 	}
 	// Collect IdentityFile from ALL matching Host blocks, the way OpenSSH does
 	// (the directive is cumulative). Taking only the first match meant a broad
@@ -247,45 +238,53 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+func serverAddress(item serverConfig) string {
+	port := item.Port
+	if port == 0 {
+		port = 22
+	}
+	address := net.JoinHostPort(item.Host, fmt.Sprint(port))
+	if user := firstNonEmpty(item.User, localUsername()); user != "" {
+		return user + "@" + address
+	}
+	return address
+}
+
 // ---------------------------------------------------------------------------
 // Auth + host-key verification
 // ---------------------------------------------------------------------------
 
-func authMethods(identity []string) ([]ssh.AuthMethod, error) {
-	var signers []ssh.Signer
-	for _, path := range identity {
-		key, err := readGuarded(path)
-		if err != nil {
-			continue // skip unreadable/guarded keys; try the next
-		}
-		signer, err := ssh.ParsePrivateKey(key)
-		if err != nil {
-			continue
-		}
-		signers = append(signers, signer)
-	}
-	if len(signers) == 0 {
-		return nil, fmt.Errorf("no usable private key found (checked: %s)", strings.Join(identity, ", "))
-	}
-	return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, nil
-}
-
 // hostKeyCallback verifies against ~/.ssh/known_hosts, adding unknown hosts
 // (accept-new, matching OpenSSH StrictHostKeyChecking=accept-new). A key that
 // CHANGED for a known host is rejected.
-func hostKeyCallback() ssh.HostKeyCallback {
+func hostKeyCallback() (ssh.HostKeyCallback, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ssh.InsecureIgnoreHostKey() // no home: degrade rather than fail
+		return nil, fmt.Errorf("find home directory for known_hosts: %w", err)
 	}
-	khPath := filepath.Join(home, ".ssh", "known_hosts")
-	_ = os.MkdirAll(filepath.Dir(khPath), 0o700)
-	if _, err := os.Stat(khPath); os.IsNotExist(err) {
-		_ = os.WriteFile(khPath, nil, 0o600)
+	return hostKeyCallbackAt(filepath.Join(home, ".ssh", "known_hosts"))
+}
+
+func hostKeyCallbackAt(path string) (ssh.HostKeyCallback, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create known_hosts directory: %w", err)
 	}
-	verify, err := knownhosts.New(khPath)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		f, createErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if createErr != nil && !os.IsExist(createErr) {
+			return nil, fmt.Errorf("create known_hosts: %w", createErr)
+		}
+		if f != nil {
+			if err := f.Close(); err != nil {
+				return nil, fmt.Errorf("close known_hosts: %w", err)
+			}
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("stat known_hosts: %w", err)
+	}
+	verify, err := knownhosts.New(path)
 	if err != nil {
-		return ssh.InsecureIgnoreHostKey()
+		return nil, fmt.Errorf("load known_hosts: %w", err)
 	}
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		err := verify(hostname, remote, key)
@@ -293,12 +292,11 @@ func hostKeyCallback() ssh.HostKeyCallback {
 			return nil
 		}
 		var keyErr *knownhosts.KeyError
-		// KeyError with no known keys = unknown host → accept-new (append).
 		if ok := asKeyError(err, &keyErr); ok && len(keyErr.Want) == 0 {
-			return appendKnownHost(khPath, hostname, remote, key)
+			return appendKnownHost(path, hostname, remote, key)
 		}
-		return err // changed/mismatched key → reject
-	}
+		return err
+	}, nil
 }
 
 func asKeyError(err error, target **knownhosts.KeyError) bool {
@@ -328,55 +326,189 @@ func appendKnownHost(path, hostname string, remote net.Addr, key ssh.PublicKey) 
 // Dial (with single-hop ProxyJump)
 // ---------------------------------------------------------------------------
 
-func dial(cfg *ssh_config.Config, alias, userOverride, portOverride string) (*session, error) {
-	r := resolveHost(cfg, alias, userOverride, portOverride)
-	auth, err := authMethods(r.identity)
+func resolveInventoryTarget(item serverConfig, userOverride, portOverride string) resolved {
+	port := fmt.Sprint(item.Port)
+	if item.Port == 0 {
+		port = "22"
+	}
+	identity := []string(nil)
+	if item.IdentityFile != "" {
+		identity = []string{expandHome(item.IdentityFile)}
+	}
+	return resolved{
+		hostName:       item.Host,
+		port:           firstNonEmpty(portOverride, port),
+		user:           firstNonEmpty(userOverride, item.User, localUsername()),
+		identity:       identity,
+		proxyJump:      item.Jump,
+		socks5Host:     item.Socks5Host,
+		socks5Port:     item.Socks5Port,
+		socks5Username: item.Socks5Username,
+		authMethod:     item.AuthMethod,
+		credentialID:   item.ID,
+		timeoutSec:     item.ConnectTimeoutSec,
+	}
+}
+
+func (s *server) resolveTarget(serverID, host, user, port string, allowDisabled bool) (resolved, error) {
+	name := strings.TrimSpace(serverID)
+	if name == "" {
+		name = strings.TrimSpace(host)
+	}
+	if name == "" {
+		return resolved{}, fmt.Errorf("server or host is required")
+	}
+	if item, ok := s.inventory.get(name); ok {
+		if !allowDisabled && !item.Enabled {
+			return resolved{}, fmt.Errorf("server %q is disabled in the local inventory", name)
+		}
+		return resolveInventoryTarget(item, user, port), nil
+	}
+	if serverID != "" {
+		return resolved{}, fmt.Errorf("server %q was not found in the local inventory", serverID)
+	}
+	if !s.settings.get().AllowAdhocHost {
+		return resolved{}, fmt.Errorf("ad-hoc hosts are disabled; add this host to the local inventory")
+	}
+	return resolveHost(s.cfg, name, user, port), nil
+}
+
+type proxyTimeoutDialer time.Duration
+
+func (d proxyTimeoutDialer) Dial(network, address string) (net.Conn, error) {
+	timeout := time.Duration(d)
+	conn, err := (&net.Dialer{Timeout: timeout}).Dial(network, address)
 	if err != nil {
 		return nil, err
 	}
-	clientCfg := &ssh.ClientConfig{
-		User:            r.user,
-		Auth:            auth,
-		HostKeyCallback: hostKeyCallback(),
-		Timeout:         dialTimeout,
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
-	target := net.JoinHostPort(r.hostName, r.port)
+	return conn, nil
+}
 
-	if r.proxyJump == "" || strings.EqualFold(r.proxyJump, "none") {
-		client, err := ssh.Dial("tcp", target, clientCfg)
+func sshClientFromConn(conn net.Conn, address string, clientConfig *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	ncc, chans, reqs, err := ssh.NewClientConn(conn, address, clientConfig)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = ncc.Close()
+		return nil, err
+	}
+	return ssh.NewClient(ncc, chans, reqs), nil
+}
+
+func dialSSHClient(target resolved, clientConfig *ssh.ClientConfig, timeout time.Duration, secrets secretStore) (*ssh.Client, error) {
+	address := net.JoinHostPort(target.hostName, target.port)
+	if target.socks5Host == "" {
+		return ssh.Dial("tcp", address, clientConfig)
+	}
+	port := target.socks5Port
+	if port == 0 {
+		port = 1080
+	}
+	host := target.socks5Host
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	var auth *proxy.Auth
+	if target.socks5Username != "" {
+		if target.credentialID == "" {
+			return nil, fmt.Errorf("SOCKS5 authentication requires an inventory server")
+		}
+		password, err := secrets.Get(socks5PasswordKey(target.credentialID))
 		if err != nil {
-			return nil, fmt.Errorf("dial %s@%s: %w", r.user, target, err)
+			if errors.Is(err, errSecretNotFound) {
+				return nil, fmt.Errorf("no SOCKS5 password is stored for server %q; set it in the local GUI", target.credentialID)
+			}
+			return nil, fmt.Errorf("read SOCKS5 password from the system keyring: %w", err)
+		}
+		auth = &proxy.Auth{User: target.socks5Username, Password: password}
+	}
+	dialer, err := proxy.SOCKS5("tcp", net.JoinHostPort(host, fmt.Sprint(port)), auth, proxyTimeoutDialer(timeout))
+	if err != nil {
+		return nil, fmt.Errorf("configure SOCKS5 proxy: %w", err)
+	}
+	conn, err := dialer.Dial("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("connect through SOCKS5 proxy %s: %w", net.JoinHostPort(host, fmt.Sprint(port)), err)
+	}
+	return sshClientFromConn(conn, address, clientConfig, timeout)
+}
+
+func dialResolved(cfg *ssh_config.Config, inventory *inventoryStore, settings *settingsStore, secrets secretStore, target resolved) (*session, error) {
+	auth, closeAuth, err := authMethods(target, secrets)
+	if err != nil {
+		return nil, err
+	}
+	defer closeAuth()
+	callback, err := hostKeyCallback()
+	if err != nil {
+		return nil, err
+	}
+	timeout := dialTimeout
+	if target.timeoutSec > 0 {
+		timeout = time.Duration(target.timeoutSec) * time.Second
+	}
+	clientCfg := &ssh.ClientConfig{User: target.user, Auth: auth, HostKeyCallback: callback, Timeout: timeout}
+	destination := net.JoinHostPort(target.hostName, target.port)
+	if target.socks5Host != "" && target.proxyJump != "" && !strings.EqualFold(target.proxyJump, "none") {
+		return nil, fmt.Errorf("a target cannot use both SOCKS5 and ProxyJump; configure SOCKS5 on the jump host instead")
+	}
+
+	if target.proxyJump == "" || strings.EqualFold(target.proxyJump, "none") {
+		client, err := dialSSHClient(target, clientCfg, timeout, secrets)
+		if err != nil {
+			return nil, fmt.Errorf("dial %s@%s: %w", target.user, destination, err)
 		}
 		return &session{client: client}, nil
 	}
 
-	// Jump through the ProxyJump host, then open the target over that channel.
-	jr := resolveHost(cfg, r.proxyJump, "", "")
-	jAuth, err := authMethods(jr.identity)
+	jump, err := (&server{cfg: cfg, inventory: inventory, settings: settings}).resolveTarget("", target.proxyJump, "", "", false)
 	if err != nil {
-		return nil, fmt.Errorf("proxyjump %s: %w", r.proxyJump, err)
+		return nil, fmt.Errorf("resolve proxyjump %q: %w", target.proxyJump, err)
 	}
-	jCfg := &ssh.ClientConfig{
-		User:            jr.user,
-		Auth:            jAuth,
-		HostKeyCallback: hostKeyCallback(),
-		Timeout:         dialTimeout,
+	if jump.proxyJump != "" && !strings.EqualFold(jump.proxyJump, "none") {
+		return nil, fmt.Errorf("proxyjump %q also has a jump configured; only one jump is supported", target.proxyJump)
 	}
-	jumpClient, err := ssh.Dial("tcp", net.JoinHostPort(jr.hostName, jr.port), jCfg)
+	jumpAuth, closeJumpAuth, err := authMethods(jump, secrets)
 	if err != nil {
-		return nil, fmt.Errorf("dial jump %s@%s: %w", jr.user, net.JoinHostPort(jr.hostName, jr.port), err)
+		return nil, fmt.Errorf("proxyjump %s: %w", target.proxyJump, err)
 	}
-	conn, err := jumpClient.Dial("tcp", target)
+	defer closeJumpAuth()
+	jumpCallback, err := hostKeyCallback()
+	if err != nil {
+		return nil, err
+	}
+	jumpConfig := &ssh.ClientConfig{
+		User:            jump.user,
+		Auth:            jumpAuth,
+		HostKeyCallback: jumpCallback,
+		Timeout:         timeout,
+	}
+	jumpAddress := net.JoinHostPort(jump.hostName, jump.port)
+	jumpClient, err := dialSSHClient(jump, jumpConfig, timeout, secrets)
+	if err != nil {
+		return nil, fmt.Errorf("dial jump %s@%s: %w", jump.user, jumpAddress, err)
+	}
+	conn, err := jumpClient.Dial("tcp", destination)
 	if err != nil {
 		_ = jumpClient.Close()
-		return nil, fmt.Errorf("tunnel to %s via %s: %w", target, r.proxyJump, err)
+		return nil, fmt.Errorf("tunnel to %s via %s: %w", destination, target.proxyJump, err)
 	}
-	ncc, chans, reqs, err := ssh.NewClientConn(conn, target, clientCfg)
+	client, err := sshClientFromConn(conn, destination, clientCfg, timeout)
 	if err != nil {
 		_ = jumpClient.Close()
-		return nil, fmt.Errorf("handshake to %s via %s: %w", target, r.proxyJump, err)
+		return nil, fmt.Errorf("handshake to %s via %s: %w", destination, target.proxyJump, err)
 	}
-	return &session{client: ssh.NewClient(ncc, chans, reqs), jump: jumpClient}, nil
+	return &session{client: client, jump: jumpClient}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -384,14 +516,27 @@ func dial(cfg *ssh_config.Config, alias, userOverride, portOverride string) (*se
 // ---------------------------------------------------------------------------
 
 type connectIn struct {
-	Host string `json:"host" jsonschema:"host alias (resolved via ~/.ssh/config) or hostname"`
-	ID   string `json:"id,omitempty" jsonschema:"session id to store the connection under (default: host)"`
-	User string `json:"user,omitempty" jsonschema:"login user override (default: config User, else local username)"`
-	Port string `json:"port,omitempty" jsonschema:"port override (default: config Port, else 22)"`
+	Server string `json:"server,omitempty" jsonschema:"named server id from ssh_list_servers; takes priority over host"`
+	Host   string `json:"host,omitempty" jsonschema:"ssh_config host alias or hostname when ad-hoc hosts are enabled"`
+	ID     string `json:"id,omitempty" jsonschema:"session id to store the connection under (default: server id or host)"`
+	User   string `json:"user,omitempty" jsonschema:"login user override"`
+	Port   string `json:"port,omitempty" jsonschema:"port override"`
 }
 type connectOut struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+}
+
+type listServersIn struct{}
+type serverSummary struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Address    string `json:"address"`
+	AuthMethod string `json:"auth_method"`
+	Enabled    bool   `json:"enabled"`
+}
+type listServersOut struct {
+	Servers []serverSummary `json:"servers"`
 }
 
 type disconnectIn struct {
@@ -407,7 +552,8 @@ type execIn struct {
 	MaxOutputBytes int    `json:"max_output_bytes,omitempty" jsonschema:"per-stream cap on returned bytes (default 131072, max 524288); overflow returns head+tail with a truncation marker"`
 }
 type quickExecIn struct {
-	Host           string `json:"host" jsonschema:"host alias or hostname"`
+	Server         string `json:"server,omitempty" jsonschema:"named server id from ssh_list_servers; takes priority over host"`
+	Host           string `json:"host,omitempty" jsonschema:"ssh_config host alias or hostname when ad-hoc hosts are enabled"`
 	Command        string `json:"command" jsonschema:"command to run"`
 	User           string `json:"user,omitempty"`
 	Port           string `json:"port,omitempty"`
@@ -458,21 +604,36 @@ type xferOut struct {
 // ---------------------------------------------------------------------------
 
 type server struct {
-	cfg   *ssh_config.Config
-	store *store
+	cfg       *ssh_config.Config
+	store     *store
+	inventory *inventoryStore
+	settings  *settingsStore
+	secrets   secretStore
 }
 
 func (s *server) connect(_ context.Context, _ *mcp.CallToolRequest, in connectIn) (*mcp.CallToolResult, connectOut, error) {
-	if strings.TrimSpace(in.Host) == "" {
-		return nil, connectOut{}, fmt.Errorf("host is required")
-	}
-	sess, err := dial(s.cfg, in.Host, in.User, in.Port)
+	target, err := s.resolveTarget(in.Server, in.Host, in.User, in.Port, false)
 	if err != nil {
 		return nil, connectOut{}, err
 	}
-	id := firstNonEmpty(in.ID, in.Host)
+	sess, err := dialResolved(s.cfg, s.inventory, s.settings, s.secrets, target)
+	if err != nil {
+		return nil, connectOut{}, err
+	}
+	id := firstNonEmpty(in.ID, in.Server, in.Host)
 	s.store.put(id, sess)
 	return nil, connectOut{ID: id, Status: "connected"}, nil
+}
+
+func (s *server) listServers(_ context.Context, _ *mcp.CallToolRequest, _ listServersIn) (*mcp.CallToolResult, listServersOut, error) {
+	out := listServersOut{Servers: make([]serverSummary, 0)}
+	for _, item := range s.inventory.list() {
+		out.Servers = append(out.Servers, serverSummary{
+			ID: item.ID, Name: item.Name, Address: serverAddress(item),
+			AuthMethod: item.AuthMethod, Enabled: item.Enabled,
+		})
+	}
+	return nil, out, nil
 }
 
 func (s *server) disconnect(_ context.Context, _ *mcp.CallToolRequest, in disconnectIn) (*mcp.CallToolResult, statusOut, error) {
@@ -518,7 +679,11 @@ func (s *server) exec(_ context.Context, _ *mcp.CallToolRequest, in execIn) (*mc
 }
 
 func (s *server) quickExec(_ context.Context, _ *mcp.CallToolRequest, in quickExecIn) (*mcp.CallToolResult, execOut, error) {
-	sess, err := dial(s.cfg, in.Host, in.User, in.Port)
+	target, err := s.resolveTarget(in.Server, in.Host, in.User, in.Port, false)
+	if err != nil {
+		return nil, execOut{}, err
+	}
+	sess, err := dialResolved(s.cfg, s.inventory, s.settings, s.secrets, target)
 	if err != nil {
 		return nil, execOut{}, err
 	}
@@ -615,55 +780,101 @@ func (s *server) download(_ context.Context, _ *mcp.CallToolRequest, in download
 // main
 // ---------------------------------------------------------------------------
 
-func enabledTools() map[string]bool {
-	all := []string{"ssh_connect", "ssh_disconnect", "ssh_exec", "ssh_quick_exec", "ssh_list_dir", "ssh_upload", "ssh_download"}
-	raw := strings.TrimSpace(os.Getenv("SSH_MCP_ENABLED_TOOLS"))
-	if raw == "" {
-		m := map[string]bool{}
-		for _, t := range all {
-			m[t] = true
+func ensureWritableDataDir(path string) error {
+	probe, err := os.CreateTemp(path, ".mcp-ssh-go-write-test-*")
+	if err != nil {
+		return fmt.Errorf("data directory %q is not writable: %w", path, err)
+	}
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("remove data directory write test: %w", err)
+	}
+	return nil
+}
+
+func run() error {
+	token := os.Getenv("SSH_MCP_AUTH_TOKEN")
+	if token == "" || strings.TrimSpace(token) != token || strings.ContainsAny(token, " \t\r\n") {
+		return fmt.Errorf("SSH_MCP_AUTH_TOKEN must be set to a non-empty token without whitespace")
+	}
+	base, err := executableDir()
+	if err != nil {
+		return fmt.Errorf("resolve executable directory: %w", err)
+	}
+	if err := ensureWritableDataDir(base); err != nil {
+		return err
+	}
+	inventory, err := openInventory(filepath.Join(base, "servers.json"))
+	if err != nil {
+		return err
+	}
+	settings, err := openSettings(filepath.Join(base, "settings.json"))
+	if err != nil {
+		return err
+	}
+	secrets := systemKeyring{}
+	s := &server{cfg: userSSHConfig(), store: newStore(), inventory: inventory, settings: settings, secrets: secrets}
+	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "mcp-ssh-go", Version: version}, nil)
+	registeredTools := enabledTools(settings.get())
+	registerTools(mcpServer, s, registeredTools)
+
+	mcpListener, err := net.Listen("tcp", mcpAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", mcpAddr, err)
+	}
+	defer mcpListener.Close()
+	mcpHTTP := &http.Server{Handler: newMCPHTTPHandler(mcpServer, token), ReadHeaderTimeout: 5 * time.Second}
+	mcpHTTP.ErrorLog = log.New(os.Stderr, "mcp-ssh-go MCP: ", 0)
+
+	var guiHTTP *http.Server
+	var guiListener net.Listener
+	if os.Getenv("SSH_MCP_GUI") != "0" {
+		guiHTTP, guiListener, err = startGUI(s, mcpServer, registeredTools)
+		if err != nil {
+			return fmt.Errorf("start local GUI: %w", err)
 		}
-		return m
+		defer guiListener.Close()
+		guiHTTP.ErrorLog = log.New(os.Stderr, "mcp-ssh-go GUI: ", 0)
+		fmt.Fprintf(os.Stderr, "mcp-ssh-go GUI: http://%s\n", guiListener.Addr())
 	}
-	m := map[string]bool{}
-	for _, t := range strings.Split(raw, ",") {
-		m[strings.TrimSpace(t)] = true
+	fmt.Fprintf(os.Stderr, "mcp-ssh-go MCP: http://%s/mcp\n", mcpListener.Addr())
+
+	serveErrors := make(chan error, 2)
+	go func() { serveErrors <- mcpHTTP.Serve(mcpListener) }()
+	if guiHTTP != nil {
+		go func() { serveErrors <- guiHTTP.Serve(guiListener) }()
 	}
-	return m
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	select {
+	case err := <-serveErrors:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("HTTP server stopped unexpectedly: %w", err)
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var shutdownErrors []error
+		if guiHTTP != nil {
+			if err := guiHTTP.Shutdown(shutdownCtx); err != nil {
+				shutdownErrors = append(shutdownErrors, err)
+			}
+		}
+		if err := mcpHTTP.Shutdown(shutdownCtx); err != nil {
+			shutdownErrors = append(shutdownErrors, err)
+		}
+		return errors.Join(shutdownErrors...)
+	}
 }
 
 func main() {
-	// Line-buffered stderr for diagnostics; stdout is the MCP transport.
-	log := bufio.NewWriter(os.Stderr)
-	defer log.Flush()
-
-	s := &server{cfg: userSSHConfig(), store: newStore()}
-	srv := mcp.NewServer(&mcp.Implementation{Name: "mcp-ssh-go", Version: version}, nil)
-
-	on := enabledTools()
-	if on["ssh_connect"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_connect", Description: "Open an SSH session (resolves ~/.ssh/config incl. ProxyJump) and store it under an id."}, s.connect)
-	}
-	if on["ssh_disconnect"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_disconnect", Description: "Close a stored SSH session."}, s.disconnect)
-	}
-	if on["ssh_exec"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_exec", Description: "Run a command on a stored SSH session and return stdout, stderr and exit code. Output over the per-stream cap (default 128 KB) is returned as head+tail with a truncation marker; narrow with head/tail/grep, or raise max_output_bytes (max 512 KB)."}, s.exec)
-	}
-	if on["ssh_quick_exec"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_quick_exec", Description: "Connect, run one command, and disconnect (stateless). Output over the per-stream cap (default 128 KB) is returned as head+tail with a truncation marker; narrow with head/tail/grep, or raise max_output_bytes (max 512 KB)."}, s.quickExec)
-	}
-	if on["ssh_list_dir"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_list_dir", Description: "List a remote directory over SFTP."}, s.listDir)
-	}
-	if on["ssh_upload"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_upload", Description: "Upload a local file to the remote host over SFTP."}, s.upload)
-	}
-	if on["ssh_download"] {
-		mcp.AddTool(srv, &mcp.Tool{Name: "ssh_download", Description: "Download a remote file to the local host over SFTP."}, s.download)
-	}
-
-	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "mcp-ssh-go:", err)
 		os.Exit(1)
 	}
