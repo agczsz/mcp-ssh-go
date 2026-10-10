@@ -11,19 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type bearerRoundTripper struct {
-	token string
-	base  http.RoundTripper
-}
-
-func (t bearerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	request = request.Clone(request.Context())
-	request.Header = request.Header.Clone()
-	request.Header.Set("Authorization", "Bearer "+t.token)
-	return t.base.RoundTrip(request)
-}
-
-func TestMCPHTTPBearerAndLiveTools(t *testing.T) {
+func TestMCPServerToolDiscoveryAndLiveUpdates(t *testing.T) {
 	settings, err := openSettings(t.TempDir() + "/settings.json")
 	if err != nil {
 		t.Fatal(err)
@@ -39,34 +27,20 @@ func TestMCPHTTPBearerAndLiveTools(t *testing.T) {
 	guiHandler := (&guiState{
 		app: app, settings: settings, mcpServer: mcpServer, registeredTools: registeredTools,
 	}).handler()
-	const token = "test-secret-token"
-	httpServer := httptest.NewServer(newMCPHTTPHandler(mcpServer, token))
-	defer httpServer.Close()
 
-	request := httptest.NewRequest(http.MethodGet, "/mcp", nil)
-	response := httptest.NewRecorder()
-	httpServer.Config.Handler.ServeHTTP(response, request)
-	if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") != "Bearer" {
-		t.Fatalf("unauthenticated request returned %d", response.Code)
-	}
-
-	request = httptest.NewRequest(http.MethodGet, "/wrong", nil)
-	request.Header.Set("Authorization", "Bearer "+token)
-	response = httptest.NewRecorder()
-	httpServer.Config.Handler.ServeHTTP(response, request)
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("non-MCP path returned %d, want 404", response.Code)
-	}
-
-	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "1"}, nil)
-	httpClient := &http.Client{Transport: bearerRoundTripper{token: token, base: http.DefaultTransport}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	clientSession, err := client.Connect(ctx, &mcp.StreamableClientTransport{
-		Endpoint: httpServer.URL + "/mcp", HTTPClient: httpClient, DisableStandaloneSSE: true,
-	}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := mcpServer.Connect(ctx, serverTransport, nil)
 	if err != nil {
-		t.Fatalf("connect to Streamable HTTP endpoint: %v", err)
+		t.Fatalf("connect in-memory server transport: %v", err)
+	}
+	defer serverSession.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "1"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect in-memory client transport: %v", err)
 	}
 	defer clientSession.Close()
 

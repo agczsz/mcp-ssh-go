@@ -2,7 +2,7 @@
 
 A minimal, **security-first SSH [MCP](https://modelcontextprotocol.io) server** — a
 single static Go binary (no Node/npm, no Python, no runtime) that gives an AI agent
-a deliberately small, auditable set of SSH capabilities over authenticated Streamable HTTP.
+a deliberately small, auditable set of SSH capabilities over stdio for Claude Desktop.
 
 Most SSH MCP servers expose *everything*: interactive PTYs, `sudo`/`su`, port
 forwarding, dozens of tools. That's a large, hard-to-audit authority surface. This
@@ -43,11 +43,9 @@ and password authentication; passwords and encrypted-key passphrases are stored 
 in the operating system keyring. Agent authentication uses `SSH_AUTH_SOCK` on Unix or
 the OpenSSH agent pipe on Windows and never falls back to password authentication.
 
-Start the executable manually. It serves the MCP Streamable HTTP endpoint at
-`http://127.0.0.1:2223/mcp` and the embedded GUI at `http://127.0.0.1:2224`.
-Both addresses are fixed; startup fails if either required port is unavailable.
-The MCP endpoint requires `Authorization: Bearer <token>` from
-`SSH_MCP_AUTH_TOKEN`. The GUI can be disabled with `SSH_MCP_GUI=0`.
+Claude Desktop launches the MCP server as a child process over stdio. It does not
+open an MCP HTTP endpoint or require a bearer token. The optional local management
+GUI listens at `http://127.0.0.1:2224`; set `SSH_MCP_GUI=0` to disable it.
 
 `servers.json` and `settings.json` live beside the running executable. The GUI
 shares the same stores as MCP, so saved server and tool settings apply immediately.
@@ -68,7 +66,6 @@ folder intact. Passwords and key passphrases are in the OS keyring, not those fi
 
 | Variable | Effect |
 |----------|--------|
-| `SSH_MCP_AUTH_TOKEN` | Required bearer token for MCP HTTP requests; use a high-entropy value with no whitespace. |
 | `SSH_MCP_ALLOWED_KEY_DIRS` | Colon/comma-separated extra directories from which private keys and `ssh_config` may be read, in addition to `~/.ssh` and `/etc/ssh`. Useful where `$HOME` is a symlink to an NFS/AD home. |
 | `SSH_MCP_ENABLED_TOOLS` | Comma-separated tool list that overrides `settings.json` when non-empty (default: all eight). |
 | `SSH_MCP_GUI` | Set to `0` to disable the local management GUI. |
@@ -136,53 +133,48 @@ Build on Linux or with Docker Buildx:
 docker buildx build --platform linux/amd64 --load -t mcp-ssh-go:local .
 ```
 
-Run on a Linux host with host networking so the fixed loopback listeners are
+Run on a Linux host with host networking so the loopback management GUI is
 available on the host. The named volume at `/app` keeps JSON data beside the
 binary; the entrypoint refreshes that binary from the image each start.
 
 ```sh
 docker volume create mcp-ssh-go-data
-docker run --rm --network host \
-  --env-file "$HOME/.config/mcp-ssh-go.env" \
+docker run --rm -i --network host \
   -v mcp-ssh-go-data:/app \
   -v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent \
   mcp-ssh-go:local
 ```
 
-The env file must contain `SSH_MCP_AUTH_TOKEN=<high-entropy-token>` and should
-be readable only by its owner. Omit the agent socket mount when using key-file
-authentication; mount the key directory read-only and set
-`SSH_MCP_ALLOWED_KEY_DIRS` to its container path. Do not bake keys or tokens into
-the image. The container does not include or automatically share the host's
+Omit the agent socket mount when using key-file authentication; mount the key
+directory read-only and set
+`SSH_MCP_ALLOWED_KEY_DIRS` to its container path. Do not bake keys into the
+image. The container does not include or automatically share the host's
 Secret Service; host networking does not expose session D-Bus. SSH password
 authentication, encrypted-key passphrases, and SOCKS5 passwords require a
 reachable Linux Secret Service and D-Bus session, explicitly mounted/configured
 with an allowed container UID. Otherwise, use the mounted SSH agent or key files.
 
-## Use with an MCP client
+## Use with Claude Desktop
 
-Configure the MCP client to connect to the already-running HTTP endpoint. Adapt this
-shape to the client's HTTP transport configuration and provide the same bearer token
-without committing it to a shared config file:
+Add a server entry to Claude Desktop's `claude_desktop_config.json` and set
+`command` to the executable's absolute path:
 
 ```json
 {
   "mcpServers": {
     "ssh": {
-      "type": "http",
-      "url": "http://127.0.0.1:2223/mcp",
-      "headers": {
-        "Authorization": "Bearer <SSH_MCP_AUTH_TOKEN>"
-      }
+      "command": "C:\\path\\to\\mcp-ssh-go.exe",
+      "args": []
     }
   }
 }
 ```
 
-When exposing the service beyond localhost, keep the process bound to loopback and
-use a reverse proxy to terminate TLS and forward the Authorization header. The
-container example below is for Linux hosts and uses host networking so the same
-loopback endpoints remain available.
+The MCP process communicates over stdio and does not need a token. Its local
+management GUI starts by default at `http://127.0.0.1:2224`; set
+`"SSH_MCP_GUI": "0"` in the `env` object to disable it. Use absolute local paths
+with `ssh_upload` and `ssh_download`, because Claude Desktop chooses the process's
+working directory.
 
 ## License
 

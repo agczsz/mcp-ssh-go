@@ -1,14 +1,14 @@
 // Command mcp-ssh-go is a minimal, security-first SSH MCP server: a single
 // static Go binary (no Node/npm, no runtime) that exposes eight least-privilege
-// tools over authenticated Streamable HTTP. It deliberately omits interactive PTY,
-// sudo/su, port-forwarding and shell-escape surfaces — every call is a
-// discrete, loggable operation.
+// tools over stdio. It deliberately omits interactive PTY, sudo/su,
+// port-forwarding and shell-escape surfaces — every call is a discrete,
+// loggable operation.
 //
 // Tools: ssh_list_servers, ssh_connect, ssh_disconnect, ssh_exec, ssh_quick_exec,
 // ssh_list_dir, ssh_upload, ssh_download.
 //
-// The MCP endpoint listens on 127.0.0.1:2223 and the local GUI on
-// 127.0.0.1:2224. JSON data is stored beside this executable.
+// The optional local GUI listens on 127.0.0.1:2224. JSON data is stored beside
+// this executable.
 package main
 
 import (
@@ -36,10 +36,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-const (
-	dialTimeout = 20 * time.Second
-	mcpAddr     = "127.0.0.1:2223"
-)
+const dialTimeout = 20 * time.Second
 
 // ---------------------------------------------------------------------------
 // Session store
@@ -797,10 +794,6 @@ func ensureWritableDataDir(path string) error {
 }
 
 func run() error {
-	token := os.Getenv("SSH_MCP_AUTH_TOKEN")
-	if token == "" || strings.TrimSpace(token) != token || strings.ContainsAny(token, " \t\r\n") {
-		return fmt.Errorf("SSH_MCP_AUTH_TOKEN must be set to a non-empty token without whitespace")
-	}
 	base, err := executableDir()
 	if err != nil {
 		return fmt.Errorf("resolve executable directory: %w", err)
@@ -822,14 +815,6 @@ func run() error {
 	registeredTools := enabledTools(settings.get())
 	registerTools(mcpServer, s, registeredTools)
 
-	mcpListener, err := net.Listen("tcp", mcpAddr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", mcpAddr, err)
-	}
-	defer mcpListener.Close()
-	mcpHTTP := &http.Server{Handler: newMCPHTTPHandler(mcpServer, token), ReadHeaderTimeout: 5 * time.Second}
-	mcpHTTP.ErrorLog = log.New(os.Stderr, "mcp-ssh-go MCP: ", 0)
-
 	var guiHTTP *http.Server
 	var guiListener net.Listener
 	if os.Getenv("SSH_MCP_GUI") != "0" {
@@ -840,37 +825,28 @@ func run() error {
 		defer guiListener.Close()
 		guiHTTP.ErrorLog = log.New(os.Stderr, "mcp-ssh-go GUI: ", 0)
 		fmt.Fprintf(os.Stderr, "mcp-ssh-go GUI: http://%s\n", guiListener.Addr())
+		go func() {
+			if err := guiHTTP.Serve(guiListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintf(os.Stderr, "mcp-ssh-go GUI stopped: %v\n", err)
+			}
+		}()
 	}
-	fmt.Fprintf(os.Stderr, "mcp-ssh-go MCP: http://%s/mcp\n", mcpListener.Addr())
-
-	serveErrors := make(chan error, 2)
-	go func() { serveErrors <- mcpHTTP.Serve(mcpListener) }()
-	if guiHTTP != nil {
-		go func() { serveErrors <- guiHTTP.Serve(guiListener) }()
-	}
+	fmt.Fprintln(os.Stderr, "mcp-ssh-go MCP: stdio")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	select {
-	case err := <-serveErrors:
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return fmt.Errorf("HTTP server stopped unexpectedly: %w", err)
-	case <-ctx.Done():
+	err = mcpServer.Run(ctx, &mcp.StdioTransport{})
+	if errors.Is(err, context.Canceled) {
+		err = nil
+	}
+	if guiHTTP != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		var shutdownErrors []error
-		if guiHTTP != nil {
-			if err := guiHTTP.Shutdown(shutdownCtx); err != nil {
-				shutdownErrors = append(shutdownErrors, err)
-			}
+		if shutdownErr := guiHTTP.Shutdown(shutdownCtx); shutdownErr != nil {
+			err = errors.Join(err, shutdownErr)
 		}
-		if err := mcpHTTP.Shutdown(shutdownCtx); err != nil {
-			shutdownErrors = append(shutdownErrors, err)
-		}
-		return errors.Join(shutdownErrors...)
 	}
+	return err
 }
 
 func main() {

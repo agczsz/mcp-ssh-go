@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, claude-desktop-stdio]
   pull_request:
   workflow_dispatch:
 
